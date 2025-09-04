@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +23,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// флаг для миграций
+	migrateOnly := flag.Bool("migrate-only", false, "Run migrations and exit")
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
@@ -35,17 +40,22 @@ func main() {
 	defer pool.Close()
 
 	// опциональные миграции
-	if cfg.RunMigrations {
+	if cfg.RunMigrations || *migrateOnly {
 		if err := db.GooseMigrationsWithPool(ctx, pool); err != nil {
 			log.Fatalf("Migration failed: %v", err)
 		}
 		log.Println("Migrations applied successfully")
+
+		if *migrateOnly {
+			log.Println("Migration only mode - exiting")
+			os.Exit(0) // Завершаем работу
+		}
 	}
 
 	// создание repository с pgxpool
 	taskRepo := repository.NewTaskRepository(pool)
-
-	handlers := service.NewHandlers(taskRepo)
+	taskService := service.NewTaskService(taskRepo)
+	handlers := service.NewHandlers(taskService)
 
 	// Настраиваем Echo
 	e := echo.New()

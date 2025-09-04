@@ -7,27 +7,37 @@ import (
 	"time"
 
 	"github.com/Vladimir-Cha/TODO_list/internal/errors"
-	"github.com/Vladimir-Cha/TODO_list/internal/service"
+	"github.com/Vladimir-Cha/TODO_list/internal/models/storage"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const dateFormat = "20060102"
 
+type TaskRepository interface {
+	CreateTask(ctx context.Context, task *storage.Task) (*storage.Task, error)
+	ListTasks(ctx context.Context) ([]*storage.Task, error)
+	GetTaskByID(ctx context.Context, id string) (*storage.Task, error)
+	UpdateTask(ctx context.Context, id string, task *storage.Task) error
+	DeleteTask(ctx context.Context, id string) error
+	MarkTaskAsDone(ctx context.Context, id string) (*storage.Task, error)
+	GetNextDate(ctx context.Context, date, repeat string, now time.Time) (string, error)
+}
+
 type taskRepository struct {
 	db *pgxpool.Pool
 }
 
-func NewTaskRepository(db *pgxpool.Pool) service.TaskRepository {
+func NewTaskRepository(db *pgxpool.Pool) *taskRepository {
 	return &taskRepository{db: db}
 }
 
-func (r *taskRepository) CreateTask(ctx context.Context, task *service.Task) (*service.Task, error) {
-
+func (r *taskRepository) CreateTask(ctx context.Context, task *storage.Task) (*storage.Task, error) {
 	query := `INSERT INTO tasks (title, description, is_done, created_at, date, repeat) 
               VALUES ($1, $2, $3, $4, $5, $6) 
               RETURNING id, created_at`
 
+	var id int64
 	err := r.db.QueryRow(ctx, query,
 		task.Title,
 		task.Description,
@@ -35,16 +45,16 @@ func (r *taskRepository) CreateTask(ctx context.Context, task *service.Task) (*s
 		time.Now(),
 		task.Date,
 		task.Repeat,
-	).Scan(&task.ID, &task.CreatedAt)
+	).Scan(&id, &task.CreatedAt)
 
 	if err != nil {
 		return nil, errors.ErrDatabase.WithError(err)
 	}
+	task.ID = strconv.FormatInt(id, 10) // Convert DB int64 to string
 	return task, nil
 }
 
-func (r *taskRepository) ListTasks(ctx context.Context) ([]*service.Task, error) {
-
+func (r *taskRepository) ListTasks(ctx context.Context) ([]*storage.Task, error) {
 	query := `SELECT id, title, description, is_done, created_at, date, repeat FROM tasks ORDER BY created_at`
 
 	rows, err := r.db.Query(ctx, query)
@@ -53,11 +63,12 @@ func (r *taskRepository) ListTasks(ctx context.Context) ([]*service.Task, error)
 	}
 	defer rows.Close()
 
-	var tasks []*service.Task
+	var tasks []*storage.Task
 	for rows.Next() {
-		var task service.Task
+		var task storage.Task
+		var id int64
 		err := rows.Scan(
-			&task.ID,
+			&id,
 			&task.Title,
 			&task.Description,
 			&task.IsDone,
@@ -68,6 +79,7 @@ func (r *taskRepository) ListTasks(ctx context.Context) ([]*service.Task, error)
 		if err != nil {
 			return nil, errors.ErrDatabase.WithError(err)
 		}
+		task.ID = strconv.FormatInt(id, 10)
 		tasks = append(tasks, &task)
 	}
 
@@ -78,13 +90,18 @@ func (r *taskRepository) ListTasks(ctx context.Context) ([]*service.Task, error)
 	return tasks, nil
 }
 
-func (r *taskRepository) GetTaskByID(ctx context.Context, id int64) (*service.Task, error) {
-	var task service.Task
+func (r *taskRepository) GetTaskByID(ctx context.Context, id string) (*storage.Task, error) {
+	idInt, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return nil, errors.ErrBadRequest.WithDetails("invalid id format")
+	}
 
+	var task storage.Task
 	query := `SELECT id, title, description, is_done, created_at, date, repeat FROM tasks WHERE id = $1`
 
-	err := r.db.QueryRow(ctx, query, id).Scan(
-		&task.ID,
+	var dbID int64
+	err = r.db.QueryRow(ctx, query, idInt).Scan(
+		&dbID,
 		&task.Title,
 		&task.Description,
 		&task.IsDone,
@@ -99,10 +116,15 @@ func (r *taskRepository) GetTaskByID(ctx context.Context, id int64) (*service.Ta
 	if err != nil {
 		return nil, errors.ErrDatabase.WithError(err)
 	}
+	task.ID = strconv.FormatInt(dbID, 10)
 	return &task, nil
 }
 
-func (r *taskRepository) UpdateTask(ctx context.Context, id int64, task *service.Task) error {
+func (r *taskRepository) UpdateTask(ctx context.Context, id string, task *storage.Task) error {
+	idInt, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return errors.ErrBadRequest.WithDetails("invalid id format")
+	}
 
 	query := `UPDATE tasks SET title = $1, description = $2, is_done = $3, date = $4, repeat = $5 
               WHERE id = $6`
@@ -113,45 +135,51 @@ func (r *taskRepository) UpdateTask(ctx context.Context, id int64, task *service
 		task.IsDone,
 		task.Date,
 		task.Repeat,
-		id,
+		idInt,
 	)
 
 	if err != nil {
 		return errors.ErrDatabase.WithError(err)
 	}
 
-	rowsAffected := result.RowsAffected()
-	if rowsAffected == 0 {
+	if result.RowsAffected() == 0 {
 		return errors.ErrNotFound
 	}
 	return nil
 }
 
-func (r *taskRepository) DeleteTask(ctx context.Context, id int64) error {
+func (r *taskRepository) DeleteTask(ctx context.Context, id string) error {
+	idInt, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return errors.ErrBadRequest.WithDetails("invalid id format")
+	}
 
 	query := `DELETE FROM tasks WHERE id = $1`
 
-	result, err := r.db.Exec(ctx, query, id)
+	result, err := r.db.Exec(ctx, query, idInt)
 	if err != nil {
 		return errors.ErrDatabase.WithError(err)
 	}
 
-	rowsAffected := result.RowsAffected()
-	if rowsAffected == 0 {
+	if result.RowsAffected() == 0 {
 		return errors.ErrNotFound
 	}
 	return nil
 }
 
-func (r *taskRepository) MarkTaskAsDone(ctx context.Context, id int64) (*service.Task, error) {
+func (r *taskRepository) MarkTaskAsDone(ctx context.Context, id string) (*storage.Task, error) {
+	idInt, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return nil, errors.ErrBadRequest.WithDetails("invalid id format")
+	}
 
-	var task service.Task
-
+	var task storage.Task
 	query := `UPDATE tasks SET is_done = true WHERE id = $1 
               RETURNING id, title, description, is_done, created_at, date, repeat`
 
-	err := r.db.QueryRow(ctx, query, id).Scan(
-		&task.ID,
+	var dbID int64
+	err = r.db.QueryRow(ctx, query, idInt).Scan(
+		&dbID,
 		&task.Title,
 		&task.Description,
 		&task.IsDone,
@@ -166,6 +194,7 @@ func (r *taskRepository) MarkTaskAsDone(ctx context.Context, id int64) (*service
 	if err != nil {
 		return nil, errors.ErrDatabase.WithError(err)
 	}
+	task.ID = strconv.FormatInt(dbID, 10)
 	return &task, nil
 }
 
